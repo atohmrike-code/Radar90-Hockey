@@ -11,6 +11,7 @@ permissions:
 jobs:
   collecte:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -19,17 +20,18 @@ jobs:
           API_KEY: ${{ secrets.API_FOOTBALL_KEY }}
         run: |
           python3 - <<'PY'
-          import json, os, datetime, urllib.request
+          import json, os, datetime, time, urllib.request
 
           key = os.environ["API_KEY"]
           base = "https://v1.handball.api-sports.io/"
           LIMITE = 92          # plan gratuit : 100 requetes par jour, on garde une marge
-          RESERVE_COTES = 35   # requetes gardees pour les cotes des matchs a venir
-          JOURS_HISTORIQUE = 45
+          PAUSE = 6.5          # plan gratuit : 10 requetes par minute maximum
           appels = 0
 
           def get(path):
               global appels
+              if appels:
+                  time.sleep(PAUSE)
               appels += 1
               req = urllib.request.Request(base + path, headers={"x-apisports-key": key})
               try:
@@ -74,7 +76,7 @@ jobs:
           if isinstance(st, dict):
               out["statut_compte"] = {"abonnement": st.get("subscription"), "requetes": st.get("requests")}
 
-          jours = (("hier", -1), ("aujourdhui", 0), ("demain", 1), ("apres_demain", 2))
+          jours = (("hier", -1), ("aujourdhui", 0), ("demain", 1))  # plan gratuit : hier a demain seulement
           for label, delta in jours:
               d = today + datetime.timedelta(days=delta)
               out[label] = get(f"games?date={d.isoformat()}&timezone=Europe/Paris")
@@ -83,21 +85,8 @@ jobs:
           if not out["hier"].get("errors") and hier not in archive["dates_faites"]:
               archive["dates_faites"].append(hier)
 
-          # Historique : on remonte les jours pas encore collectes, dans la limite du budget
-          ajoutes = []
-          for k in range(2, JOURS_HISTORIQUE + 1):
-              if appels >= LIMITE - RESERVE_COTES:
-                  break
-              d = (today - datetime.timedelta(days=k)).isoformat()
-              if d in archive["dates_faites"]:
-                  continue
-              rep = get(f"games?date={d}&timezone=Europe/Paris")
-              if rep.get("errors"):
-                  out.setdefault("erreurs_historique", {})[d] = rep.get("errors")
-                  continue
-              fusionner(rep)
-              archive["dates_faites"].append(d)
-              ajoutes.append(d)
+          # Historique : le plan gratuit ne donne que hier, aujourd'hui et demain ; l'archive grossit d'un jour a chaque collecte
+          ajoutes = [hier] if hier in archive["dates_faites"] else []
 
           # Cotes des matchs pas encore commences (aujourd'hui puis demain), par heure
           a_venir = []

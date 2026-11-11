@@ -1,0 +1,145 @@
+name: Radar 90 Rugby - collecte des matchs
+
+on:
+  schedule:
+    - cron: "35 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  collecte:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Recuperer les matchs, l'historique et les cotes
+        env:
+          API_KEY: ${{ secrets.API_FOOTBALL_KEY }}
+        run: |
+          python3 - <<'PY'
+          import json, os, datetime, time, urllib.request
+
+          key = os.environ["API_KEY"]
+          base = "https://v1.rugby.api-sports.io/"
+          LIMITE = 92          # plan gratuit : 100 requetes par jour, on garde une marge
+          PAUSE = 6.5          # plan gratuit : 10 requetes par minute maximum
+          appels = 0
+
+          def get(path):
+              global appels
+              if appels:
+                  time.sleep(PAUSE)
+              appels += 1
+              req = urllib.request.Request(base + path, headers={"x-apisports-key": key})
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      return json.load(r)
+              except Exception as e:
+                  return {"response": [], "errors": {"exception": str(e)}}
+
+          TERMINES = {"FT", "AET", "AP", "PEN", "AWD", "WO"}
+
+          def resume(g):
+              return {"id": g.get("id"), "date": g.get("date"), "status": (g.get("status") or {}).get("short"),
+                      "country": (g.get("country") or {}).get("name"), "league": (g.get("league") or {}).get("name"),
+                      "league_id": (g.get("league") or {}).get("id"), "season": (g.get("league") or {}).get("season"),
+                      "home": ((g.get("teams") or {}).get("home") or {}).get("name"),
+                      "home_id": ((g.get("teams") or {}).get("home") or {}).get("id"),
+                      "away": ((g.get("teams") or {}).get("away") or {}).get("name"),
+                      "away_id": ((g.get("teams") or {}).get("away") or {}).get("id"),
+                      "scores": g.get("scores"), "periods": g.get("periods")}
+
+          os.makedirs("data", exist_ok=True)
+          chemin_archive = "data/rugby_archive.json"
+          try:
+              with open(chemin_archive) as f:
+                  archive = json.load(f)
+          except Exception:
+              archive = {"games": {}, "dates_faites": []}
+          archive.setdefault("games", {})
+          archive.setdefault("dates_faites", [])
+
+          def fusionner(rep):
+              n = 0
+              for g in rep.get("response", []) or []:
+                  if (g.get("status") or {}).get("short") in TERMINES and g.get("id") is not None:
+                      archive["games"][str(g["id"])] = resume(g)
+                      n += 1
+              return n
+
+          today = datetime.date.today()
+          out = {"genere_le": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "statut_compte": {}}
+          st = get("status").get("response", {})
+          if isinstance(st, dict):
+              out["statut_compte"] = {"abonnement": st.get("subscription"), "requetes": st.get("requests")}
+
+          jours = (("hier", -1), ("aujourdhui", 0), ("demain", 1))  # plan gratuit : hier a demain seulement
+          for label, delta in jours:
+              d = today + datetime.timedelta(days=delta)
+              out[label] = get(f"games?date={d.isoformat()}&timezone=Europe/Paris")
+              fusionner(out[label])
+          hier = (today - datetime.timedelta(days=1)).isoformat()
+          if not out["hier"].get("errors") and hier not in archive["dates_faites"]:
+              archive["dates_faites"].append(hier)
+
+          # Historique : le plan gratuit ne donne que hier, aujourd'hui et demain ; l'archive grossit d'un jour a chaque collecte
+          ajoutes = [hier] if hier in archive["dates_faites"] else []
+
+          # Cotes des matchs pas encore commences (aujourd'hui puis demain), par heure
+          a_venir = []
+          for label in ("aujourdhui", "demain"):
+              for g in out[label].get("response", []) or []:
+                  if (g.get("status") or {}).get("short") == "NS":
+                      a_venir.append(g)
+          a_venir.sort(key=lambda g: g.get("timestamp") or 0)
+          PRIORITE = ("betwinner", "1xbet", "betclic", "pinnacle", "bet365", "unibet")
+
+          def trier_bookmakers(bks):
+              def rang(b):
+                  n = (b.get("name") or "").lower()
+                  for i, p in enumerate(PRIORITE):
+                      if p in n:
+                          return i
+                  return len(PRIORITE)
+              bks = sorted(bks, key=rang)[:4]
+              return [{"name": b.get("name"), "bets": [{"name": x.get("name"), "values": x.get("values")}
+                                                        for x in (b.get("bets") or [])]} for b in bks]
+
+          cotes = {}
+          erreur_cotes = None
+          for g in a_venir:
+              if appels >= LIMITE:
+                  break
+              rep = get(f"odds?game={g['id']}")
+              if rep.get("errors"):
+                  erreur_cotes = rep.get("errors")
+                  break
+              for item in rep.get("response", []) or []:
+                  cotes[str(g["id"])] = trier_bookmakers(item.get("bookmakers") or [])
+
+          out["requetes_utilisees"] = appels
+          out["historique"] = {"matchs_archives": len(archive["games"]), "jours_collectes": len(archive["dates_faites"]),
+                               "jours_ajoutes_ce_matin": ajoutes}
+          out["cotes"] = {"matchs_avec_cotes": len(cotes), "matchs_a_venir": len(a_venir), "erreur": erreur_cotes}
+          archive["dates_faites"] = sorted(set(archive["dates_faites"]))
+          with open("data/rugby_latest.json", "w") as f:
+              json.dump(out, f, ensure_ascii=False)
+          with open(chemin_archive, "w") as f:
+              json.dump(archive, f, ensure_ascii=False)
+          with open("data/rugby_cotes.json", "w") as f:
+              json.dump({"genere_le": out["genere_le"], "cotes": cotes}, f, ensure_ascii=False)
+          print("OK", {k: len(out[k].get("response", []) or []) for k, _ in jours},
+                "requetes:", appels, "archive:", len(archive["games"]), "cotes:", len(cotes), "erreur cotes:", erreur_cotes)
+          PY
+
+      - name: Enregistrer
+        run: |
+          git config user.name "radar90-rugby-bot"
+          git config user.email "radar90-rugby-bot@users.noreply.github.com"
+          git pull --rebase || true
+          git add data
+          git commit -m "Collecte rugby du $(date +%F)" || echo "rien de nouveau"
+          git push
